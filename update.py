@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Python version: 3.6
 import math
-import random
+from random import random
 
 import torch
 from torch import nn
@@ -83,115 +83,89 @@ class LocalUpdate(object):
             elif self.args.optimizer == 'adam':
                 optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr,
                                              weight_decay=1e-4)
-            grad_history = {}
-            # c = 0
-
-            for iter in range(1,self.args.local_ep+1):
-                # c = int(max(1, iter // 2))  # 使用整除而非浮点数除法
-                c=iter
+            for iter in range(self.args.local_ep):
                 batch_loss = []
 
+                l1_norms = []  # 存储每一次迭代轮次的 L1 范数
+                # print("使用平均值选取裁剪阈值")
                 for batch_idx, (images, labels) in enumerate(self.trainloader):
                     images, labels = images.to(self.device), labels.to(self.device)
 
                     # 清除模型参数的梯度
                     model.zero_grad()
-
-                    # 前向传播
                     log_probs = model(images)
-
-                    # 计算损失
                     loss = self.criterion(log_probs, labels)
 
-                    # 反向传播
                     loss.backward()
-
-                    # 裁剪梯度
-                    clipped_grads = []
-                    for name, param in model.named_parameters():
-                        if param.grad is not None:
-                            if name not in grad_history:
-                                grad_history[name] = []
-                            grad_norm = torch.norm(param.grad, p=2)
-                            grad_history[name].append(grad_norm.item())
-                            if len(grad_history[name]) > c:
-                                grad_history[name].pop(0)
-                            recent_l2_norms = grad_history[name]
-                            threshold = sum(recent_l2_norms) / len(recent_l2_norms)
-                            if grad_norm > threshold:
-                                clipped_grad = (param.grad / grad_norm) * threshold
-                            else:
-                                clipped_grad = param.grad
-                            clipped_grads.append(clipped_grad)
-                            # 注意：这里不实际更新param.grad，因为optimizer.step()会处理
-
-                    # 更新优化器
                     optimizer.step()
-                    optimizer.zero_grad()  # 重置梯度为0，以便下一次迭代
-                    # 记录损失
-                    batch_loss.append(loss.item())
+                    # print("loss", loss.item())
                     self.logger.add_scalar('loss', loss.item())
 
-                    # 如果这是最后一个批次，并且需要添加噪声
-                    # if batch_idx == len(self.trainloader):
-                    if iter == self.args.local_ep+1:
-                        for name, param in model.named_parameters():
-                                sc=0
+                    batch_loss.append(loss.item())
+                    epoch_loss.append(sum(batch_loss) / len(batch_loss))
+                    # # 迭代训练elf.device), labels.to(self.device)
+                    # print("loss", loss.item())
+                    if iter==self.args.local_ep:
+                        clipped_gradients = []
+
+                        # 获取神经网络每层的梯度
+                        layer_gradients = [param.grad for param in model.parameters() if param.grad is not None]
+                        # 计算裁剪阈值
+                        # 根据每层的L1梯度范数均值计算裁剪阈值
+                        clipped_gradients=[]
+                        for grad in layer_gradients:
+                            clipped_grads=[]
+                            explions = 0
+                            # threshold = [torch.mean(torch.abs(grad)) for grad in layer_gradients]
+                            l1_norm_grad = [torch.norm(grad, p=1) for grad in layer_gradients]
+                            threshold = (torch.stack(l1_norm_grad))/iter
+                            # else:
+                            #     # threshold = np.sqrt([torch.norm(grad, p=1) for grad in layer_gradients])
+                            #     l1_norm_grad = [torch.norm(grad, p=1) for grad in layer_gradients]
+                            #     threshold = np.sqrt((torch.stack(l1_norm_grad))/iter)
+                            norm=torch.norm(grad, p=1)
+                            if norm > threshold:
+                                clipped_grad = (grad / norm) * threshold
+                            else:
+                                clipped_grad = grad
+                            clipped_grads.append(clipped_grad)
+                            clipped_gradients.append(clipped_grad)
+                            explions=sum(clipped_grads)/sum(clipped_gradients)
+                            print(" explions")
+
+                        # 更新本地参数
+                            for param, clipped_grad in zip(model.parameters(), clipped_gradients,explions):
                                 if param.grad is not None:
-                                    if name not in grad_history:
-                                        grad_history[name] = []
-                                    grad_norm = torch.norm(param.grad, p=2)
-                                    grad_history[name].append(grad_norm.item())
-                                    if len(grad_history[name]) > c:
-                                        grad_history[name].pop(0)
-                                    recent_l2_norms = grad_history[name]
-                                    threshold = sum(recent_l2_norms) / len(recent_l2_norms)
-                                    if grad_norm > threshold:
-                                        clipped_grad = (param.grad / grad_norm) * threshold
-                                    else:
-                                        clipped_grad = param.grad
-                                    sc=sc+clipped_grad
-                        explions=sc/sum(grad_history[name])
-                        f=random.uniform(-0.5, 0.5)
-                        μ=0
-                        if f<0:
-                            noise_scale = μ+(2*self.args.lr*clipped_grad*math.log(1+2*f))/explions
-                        else:
-                            noise_scale = μ + (2 * self.args.lr * clipped_grad * math.log(1 - 2 * f)) / explions
+                                    param.data.add_(-self.args.lr * clipped_grad)
+                            avg_grad = torch.sum(clipped_grads, dim=0) / len(clipped_grads)
+                            # 计算平均梯度并更新本地参数
+                            for param in model.parameters():
+                                    if param.grad is not None:
+                                        param.data.add_(-self.args.lr *  avg_grad)
+                        # avg_grad = torch.sum(clipped_grads, dim=0) / len(clipped_grads)
+                        # for param in model.parameters():
+                        #     if param.grad is not None:
+                        #         param.data.add_(-self.args.lr * avg_grad)
 
-                            noise = torch.randn_like(param) * noise_scale
-                            param.data.add_(noise)
-        return model.state_dict(), sum(batch_loss) / len(batch_loss)
+                            optimizer.step()
+                            print("loss", loss.item())
+                            self.logger.add_scalar('loss', loss.item())
 
-                    #    # 更新本地参数
-                    # for param, clipped_grad in zip(model.parameters(), clipped_gradients):
-                    #     if param.grad is not None:
-                    #         param.data=clipped_grad
-                    # optimizer.step()
-                    # # print("loss", loss.item())
-                    # self.logger.add_scalar('loss', loss.item())
-                    # batch_loss.append(loss.item())
-                    # epoch_loss.append(sum(batch_loss) / len(batch_loss))
-                    # if iter == self.args.local_ep:
-                    # # 当前层比上全部层裁剪后的梯度范数
-                    #   sum_clipped_grads = clipped_grads.sum()
-                    #   sum_clipped_gradients = clipped_gradients.sum()
-                    #   explions = sum_clipped_grads / sum_clipped_gradients
-                    #   μ = 0
-                    #   # 将每层梯度裁剪并加噪声
-                    #   for grad, threshold in zip(layer_gradients, threshold):
-                    #      clipped_grad = torch.clamp(grad, max=threshold)
-                    #      # f=random.uniform(-0.5, 0.5)
-                    #      f=0.1
-                    #
-                    #      if f<0:
-                    #          noisy_grad = μ+(2*self.args.lr*clipped_grad*math.log(1+2*f))/explions
-                    #      else:
-                    #          noisy_grad = μ + (2 * self.args.lr * clipped_grad * math.log(1 - 2 * f)) / explions
-                    #      print('noisy', noisy_grad)
-                    #      param.data.add_(-self.args.lr * noisy_grad)
+                            batch_loss.append(loss.item())
+                            epoch_loss.append(sum(batch_loss) / len(batch_loss))
+                            # 将每层梯度裁剪并加噪声
+                            for grad, threshold in zip(layer_gradients, threshold):
+                                clipped_grad = torch.clamp(grad, max=threshold)
+                                f=random.uniform(-0.5, 0.5)
+                                μ=0
+                                if f<0:
+                                  noisy_grad = μ+(2*self.args.lr*clipped_grad*math.log(1+2*f))/explions
+                                else:
+                                  noisy_grad = μ + (2 * self.args.lr * clipped_grad * math.log(1 - 2 * f)) / explions
+                                print('noisy',noisy_grad)
+                                param.data.add_(noisy_grad )
 
-
+            return model.state_dict(),  sum(epoch_loss) / len(epoch_loss)
 
     # 定义了一个用于推断模型的方法inference
     def inference(self, model):
